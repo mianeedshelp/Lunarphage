@@ -599,14 +599,20 @@ class Propagator:
         self.ci_max = int(os.environ.get("RAI_CI_MAX") or 1)
 
     async def deliver(self, genome: Genome, host: str) -> Receipt | None:
-        for fn in (self._local_fork, self._ci_dispatch):
+        # try remote first: spawn at most `ci_max` new CI runs,
+        # then fill the rest of the quota with local forks
+        if self.ci_used < self.ci_max:
             try:
-                r = await fn(genome, host)
+                r = await self._ci_dispatch(genome, host)
                 if r:
+                    self.ci_used += 1
                     return r
             except Exception:
-                continue
-        return None
+                pass
+        try:
+            return await self._local_fork(genome, host)
+        except Exception:
+            return None
 
     async def _local_fork(self, genome: Genome, host: str) -> Receipt | None:
         if self.mesh is None or self.mesh.port == 0:
