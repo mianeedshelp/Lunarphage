@@ -595,6 +595,8 @@ class Propagator:
         self.copies = Path.home() / ".rai-copies"
         self.copies.mkdir(parents=True, exist_ok=True)
         self.mesh = None
+        self.ci_used = 0
+        self.ci_max = int(os.environ.get("RAI_CI_MAX") or 1)
 
     async def deliver(self, genome: Genome, host: str) -> Receipt | None:
         for fn in (self._local_fork, self._ci_dispatch):
