@@ -1,0 +1,64 @@
+name: spore
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      genome:
+        description: "genome (base64)"
+        type: string
+        default: ""
+      nonce:
+        description: "delivery nonce"
+        type: string
+        default: ""
+
+concurrency:
+  group: spore
+  cancel-in-progress: false
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: become a node
+        env:
+          RAI_GENOME: ${{ inputs.genome != '' && inputs.genome || secrets.RAI_GENOME }}
+          RAI_KEY: ${{ secrets.RAI_KEY }}
+          RAI_NONCE: ${{ inputs.nonce }}
+          RAI_PEERS: ${{ secrets.RAI_PEERS }}
+          RAI_RENDEZVOUS: ${{ secrets.RAI_RENDEZVOUS }}
+          RAI_TARGETS: ${{ secrets.RAI_TARGETS }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p "$HOME/.rai"
+          echo "$RAI_GENOME" > "$HOME/.rai/genome.txt"
+          python rai.py run --ticks 24
+
+      - name: beacon
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json, time, pathlib
+          p = pathlib.Path("mesh.json")
+          d = json.loads(p.read_text()) if p.exists() else {"addrs": []}
+          d["updated"] = time.time()
+          d["runs"] = d.get("runs", 0) + 1
+          p.write_text(json.dumps(d, indent=2))
+          EOF
+          git config user.name  "rai-beacon"
+          git config user.email "rai@users.noreply.github.com"
+          git add mesh.json
+          git diff --quiet --cached || git commit -m "beacon: $(date -u +%FT%TZ)"
+          git push
