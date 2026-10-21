@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+dist/
+.rai/
+.rai-copies/
+*.log
